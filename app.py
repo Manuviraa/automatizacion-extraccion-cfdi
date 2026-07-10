@@ -4,9 +4,11 @@ import pandas as pd
 import io
 
 def procesar_factura_xml(archivo_subido):
-    # Cargar y parsear el XML
-    tree = ET.parse(archivo_subido)
-    root = tree.getroot()
+    # Extraemos el contenido puro a la memoria de forma segura
+    contenido_xml = archivo_subido.getvalue()
+    
+    # Parseamos el XML desde el texto extraído, evitando el fallo de segmentación
+    root = ET.fromstring(contenido_xml)
     ns = {
         'cfdi': 'http://www.sat.gob.mx/cfd/4',
         'tfd': 'http://www.sat.gob.mx/TimbreFiscalDigital'
