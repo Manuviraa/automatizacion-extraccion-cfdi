@@ -4,84 +4,114 @@ import pandas as pd
 import io
 
 def procesar_factura_xml(archivo_subido):
-    # Extraemos el contenido puro a la memoria de forma segura
-    contenido_xml = archivo_subido.getvalue()
+    # Guardamos el nombre por si hay un error, saber cuál archivo falló
+    nombre_archivo = archivo_subido.name
     
-    # Parseamos el XML desde el texto extraído, evitando el fallo de segmentación
-    root = ET.fromstring(contenido_xml)
-    ns = {
-        'cfdi': 'http://www.sat.gob.mx/cfd/4',
-        'tfd': 'http://www.sat.gob.mx/TimbreFiscalDigital'
-    }
+    try:
+        # Extraemos y decodificamos a texto plano
+        contenido_bytes = archivo_subido.getvalue()
+        contenido_texto = contenido_bytes.decode('utf-8', errors='ignore')
+        root = ET.fromstring(contenido_texto)
+        
+        # 1. Detectar versión para adaptar el namespace (3.3 o 4.0)
+        version = root.attrib.get('Version', '4.0')
+        ns_cfdi = 'http://www.sat.gob.mx/cfd/3' if version == '3.3' else 'http://www.sat.gob.mx/cfd/4'
+        
+        ns = {
+            'cfdi': ns_cfdi,
+            'tfd': 'http://www.sat.gob.mx/TimbreFiscalDigital'
+        }
 
-    # 1. Extracción de Identificadores y Fecha
-    emisor = root.find('.//cfdi:Emisor', ns).attrib.get('Nombre', 'Sin emisor')
-    receptor = root.find('.//cfdi:Receptor', ns).attrib.get('Nombre', 'Sin receptor')
-    
-    # Extracción de la fecha de emisión
-    fecha_emision = root.attrib.get('Fecha', 'Sin fecha')
-    
-    tipo_letra = root.attrib.get('TipoDeComprobante', '')
-    mapa_comprobantes = {'I': 'Ingreso', 'E': 'Egreso', 'T': 'Traslado', 'P': 'Pago', 'N': 'Nómina'}
-    efecto_comprobante = mapa_comprobantes.get(tipo_letra, tipo_letra)
-    
-    # Múltiples conceptos unidos por <>
-    lista_descripciones = [nodo.attrib.get('Descripcion', 'Sin descripción') 
-                           for nodo in root.findall('.//cfdi:Conceptos/cfdi:Concepto', ns)]
-    descripcion_unida = " <> ".join(lista_descripciones)
-    
-    folio_fiscal = root.find('.//cfdi:Complemento/tfd:TimbreFiscalDigital', ns).attrib.get('UUID')
+        # 2. Extracciones seguras (Validamos que no sea 'None')
+        nodo_emisor = root.find('.//cfdi:Emisor', ns)
+        emisor = nodo_emisor.attrib.get('Nombre', 'Sin emisor') if nodo_emisor is not None else 'Sin emisor'
+        
+        nodo_receptor = root.find('.//cfdi:Receptor', ns)
+        receptor = nodo_receptor.attrib.get('Nombre', 'Sin receptor') if nodo_receptor is not None else 'Sin receptor'
+        
+        fecha_emision = root.attrib.get('Fecha', 'Sin fecha')
+        
+        tipo_letra = root.attrib.get('TipoDeComprobante', '')
+        mapa_comprobantes = {'I': 'Ingreso', 'E': 'Egreso', 'T': 'Traslado', 'P': 'Pago', 'N': 'Nómina'}
+        efecto_comprobante = mapa_comprobantes.get(tipo_letra, tipo_letra)
+        
+        # Conceptos seguros
+        lista_descripciones = [nodo.attrib.get('Descripcion', 'Sin descripción') 
+                               for nodo in root.findall('.//cfdi:Conceptos/cfdi:Concepto', ns)]
+        descripcion_unida = " <> ".join(lista_descripciones) if lista_descripciones else "Sin conceptos"
+        
+        # Timbre fiscal seguro
+        nodo_timbre = root.find('.//cfdi:Complemento/tfd:TimbreFiscalDigital', ns)
+        folio_fiscal = nodo_timbre.attrib.get('UUID', 'Sin UUID') if nodo_timbre is not None else 'Sin UUID'
 
-    # 2. Extracción de Totales Base
-    subtotal = float(root.attrib.get('SubTotal', 0.0))
-    descuento = float(root.attrib.get('Descuento', 0.0))
-    subtotal_neto = subtotal - descuento
-    total_factura = float(root.attrib.get('Total', 0.0))
+        # 3. Extracción de Totales Base
+        subtotal = float(root.attrib.get('SubTotal', 0.0))
+        descuento = float(root.attrib.get('Descuento', 0.0))
+        subtotal_neto = subtotal - descuento
+        total_factura = float(root.attrib.get('Total', 0.0))
 
-    # 3. Inicializar variables de impuestos
-    iva_trasladado = 0.0
-    ieps_trasladado = 0.0
-    iva_retenido = 0.0
-    isr_retenido = 0.0
+        # 4. Búsqueda de Impuestos Globales
+        iva_trasladado = 0.0
+        ieps_trasladado = 0.0
+        iva_retenido = 0.0
+        isr_retenido = 0.0
 
-    # 4. Búsqueda de Impuestos Globales
-    traslados = root.findall('./cfdi:Impuestos/cfdi:Traslados/cfdi:Traslado', ns)
-    for t in traslados:
-        impuesto = t.attrib.get('Impuesto')
-        importe = float(t.attrib.get('Importe', 0.0))
-        if impuesto == '002':
-            iva_trasladado += importe
-        elif impuesto == '003':
-            ieps_trasladado += importe
+        traslados = root.findall('./cfdi:Impuestos/cfdi:Traslados/cfdi:Traslado', ns)
+        for t in traslados:
+            impuesto = t.attrib.get('Impuesto')
+            importe = float(t.attrib.get('Importe', 0.0))
+            if impuesto == '002':
+                iva_trasladado += importe
+            elif impuesto == '003':
+                ieps_trasladado += importe
 
-    retenciones = root.findall('./cfdi:Impuestos/cfdi:Retenciones/cfdi:Retencion', ns)
-    for r in retenciones:
-        impuesto = r.attrib.get('Impuesto')
-        importe = float(r.attrib.get('Importe', 0.0))
-        if impuesto == '002':
-            iva_retenido += importe
-        elif impuesto == '001':
-            isr_retenido += importe
+        retenciones = root.findall('./cfdi:Impuestos/cfdi:Retenciones/cfdi:Retencion', ns)
+        for r in retenciones:
+            impuesto = r.attrib.get('Impuesto')
+            importe = float(r.attrib.get('Importe', 0.0))
+            if impuesto == '002':
+                iva_retenido += importe
+            elif impuesto == '001':
+                isr_retenido += importe
 
-    # 5. Estructurar la fila con la fecha añadida al final
-    fila = {
-        "Nombre emisor": emisor,
-        "Nombre receptor": receptor,
-        "Efecto del comprobante": efecto_comprobante,
-        "Descripción": descripcion_unida,
-        "Subtotal": subtotal,
-        "Descuento": descuento,
-        "Subtotal Neto": round(subtotal_neto, 2),
-        "IVA Trasladado": round(iva_trasladado, 2),
-        "IEPS Trasladado": round(ieps_trasladado, 2),
-        "IVA Retenido": round(iva_retenido, 2),
-        "ISR Retenido": round(isr_retenido, 2),
-        "Total (Calculado)": round(subtotal_neto + iva_trasladado + ieps_trasladado - iva_retenido - isr_retenido, 2),
-        "Total (XML)": total_factura,
-        "Folio Fiscal": folio_fiscal,
-        "Fecha de Emisión": fecha_emision
-    }
-    return fila
+        # 5. Estructurar la fila final
+        return {
+            "Nombre emisor": emisor,
+            "Nombre receptor": receptor,
+            "Efecto del comprobante": efecto_comprobante,
+            "Descripción": descripcion_unida,
+            "Subtotal": subtotal,
+            "Descuento": descuento,
+            "Subtotal Neto": round(subtotal_neto, 2),
+            "IVA Trasladado": round(iva_trasladado, 2),
+            "IEPS Trasladado": round(ieps_trasladado, 2),
+            "IVA Retenido": round(iva_retenido, 2),
+            "ISR Retenido": round(isr_retenido, 2),
+            "Total (Calculado)": round(subtotal_neto + iva_trasladado + ieps_trasladado - iva_retenido - isr_retenido, 2),
+            "Total (XML)": total_factura,
+            "Folio Fiscal": folio_fiscal,
+            "Fecha de Emisión": fecha_emision
+        }
+
+    except Exception as e:
+        # Si ocurre CUALQUIER error de formato, generamos una fila de alerta sin apagar la app
+        return {
+            "Nombre emisor": "ERROR DE LECTURA",
+            "Nombre receptor": "ERROR DE LECTURA",
+            "Efecto del comprobante": "Desconocido",
+            "Descripción": f"El archivo '{nombre_archivo}' no es una factura válida o está dañado.",
+            "Subtotal": 0.0,
+            "Descuento": 0.0,
+            "Subtotal Neto": 0.0,
+            "IVA Trasladado": 0.0,
+            "IEPS Trasladado": 0.0,
+            "IVA Retenido": 0.0,
+            "ISR Retenido": 0.0,
+            "Total (Calculado)": 0.0,
+            "Total (XML)": 0.0,
+            "Folio Fiscal": "ERROR",
+            "Fecha de Emisión": "ERROR"
+        }
 
 # ==========================================
 # INTERFAZ GRÁFICA DE STREAMLIT
