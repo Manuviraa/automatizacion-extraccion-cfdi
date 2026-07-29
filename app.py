@@ -4,53 +4,62 @@ import pandas as pd
 import io
 
 def procesar_factura_xml(archivo_subido):
-    # Guardamos el nombre por si hay un error, saber cuál archivo falló
     nombre_archivo = archivo_subido.name
     
     try:
-        # Extraemos y decodificamos a texto plano
         contenido_bytes = archivo_subido.getvalue()
         contenido_texto = contenido_bytes.decode('utf-8', errors='ignore')
         root = ET.fromstring(contenido_texto)
         
-        # 1. Detectar versión para adaptar el namespace (3.3 o 4.0)
-        version = root.attrib.get('Version', '4.0')
-        ns_cfdi = 'http://www.sat.gob.mx/cfd/3' if version == '3.3' else 'http://www.sat.gob.mx/cfd/4'
+        # 1. Detectar versión
+        version = root.attrib.get('Version') or root.attrib.get('version', '4.0')
         
+        # Las versiones 3.2 y 3.3 comparten el mismo namespace base pero 3.2 usaba minúsculas
+        ns_cfdi = 'http://www.sat.gob.mx/cfd/3' if version in ['3.2', '3.3'] else 'http://www.sat.gob.mx/cfd/4'
         ns = {
             'cfdi': ns_cfdi,
             'tfd': 'http://www.sat.gob.mx/TimbreFiscalDigital'
         }
 
-        # 2. Extracciones seguras (Validamos que no sea 'None')
+        # 2. Extracciones de datos
         nodo_emisor = root.find('.//cfdi:Emisor', ns)
-        emisor = nodo_emisor.attrib.get('Nombre', 'Sin emisor') if nodo_emisor is not None else 'Sin emisor'
+        emisor = 'Sin emisor'
+        if nodo_emisor is not None:
+            emisor = nodo_emisor.attrib.get('Nombre') or nodo_emisor.attrib.get('nombre', 'Sin emisor')
         
         nodo_receptor = root.find('.//cfdi:Receptor', ns)
-        receptor = nodo_receptor.attrib.get('Nombre', 'Sin receptor') if nodo_receptor is not None else 'Sin receptor'
+        receptor = 'Sin receptor'
+        if nodo_receptor is not None:
+            receptor = nodo_receptor.attrib.get('Nombre') or nodo_receptor.attrib.get('nombre', 'Sin receptor')
         
-        fecha_emision = root.attrib.get('Fecha', 'Sin fecha')
+        fecha_emision = root.attrib.get('Fecha') or root.attrib.get('fecha', 'Sin fecha')
         
-        tipo_letra = root.attrib.get('TipoDeComprobante', '')
+        # En CFDI 3.2 el comprobante era "ingreso" o "egreso", extraemos solo la primera letra
+        tipo_letra = root.attrib.get('TipoDeComprobante') or root.attrib.get('tipoDeComprobante', '')
+        letra_inicial = tipo_letra.upper()[0] if tipo_letra else ''
         mapa_comprobantes = {'I': 'Ingreso', 'E': 'Egreso', 'T': 'Traslado', 'P': 'Pago', 'N': 'Nómina'}
-        efecto_comprobante = mapa_comprobantes.get(tipo_letra, tipo_letra)
+        efecto_comprobante = mapa_comprobantes.get(letra_inicial, tipo_letra)
         
-        # Conceptos seguros
-        lista_descripciones = [nodo.attrib.get('Descripcion', 'Sin descripción') 
-                               for nodo in root.findall('.//cfdi:Conceptos/cfdi:Concepto', ns)]
+        # Conceptos
+        lista_descripciones = []
+        for nodo in root.findall('.//cfdi:Conceptos/cfdi:Concepto', ns):
+            desc = nodo.attrib.get('Descripcion') or nodo.attrib.get('descripcion', 'Sin descripción')
+            lista_descripciones.append(desc)
         descripcion_unida = " <> ".join(lista_descripciones) if lista_descripciones else "Sin conceptos"
         
-        # Timbre fiscal seguro
+        # Timbre fiscal
         nodo_timbre = root.find('.//cfdi:Complemento/tfd:TimbreFiscalDigital', ns)
-        folio_fiscal = nodo_timbre.attrib.get('UUID', 'Sin UUID') if nodo_timbre is not None else 'Sin UUID'
+        folio_fiscal = 'Sin UUID'
+        if nodo_timbre is not None:
+            folio_fiscal = nodo_timbre.attrib.get('UUID', 'Sin UUID')
 
         # 3. Extracción de Totales Base
-        subtotal = float(root.attrib.get('SubTotal', 0.0))
-        descuento = float(root.attrib.get('Descuento', 0.0))
+        subtotal = float(root.attrib.get('SubTotal') or root.attrib.get('subTotal', 0.0))
+        descuento = float(root.attrib.get('Descuento') or root.attrib.get('descuento', 0.0))
         subtotal_neto = subtotal - descuento
-        total_factura = float(root.attrib.get('Total', 0.0))
+        total_factura = float(root.attrib.get('Total') or root.attrib.get('total', 0.0))
 
-        # 4. Búsqueda de Impuestos Globales
+        # 4. Búsqueda de Impuestos (Mapeando códigos de v4.0 y textos de v3.2)
         iva_trasladado = 0.0
         ieps_trasladado = 0.0
         iva_retenido = 0.0
@@ -58,20 +67,24 @@ def procesar_factura_xml(archivo_subido):
 
         traslados = root.findall('./cfdi:Impuestos/cfdi:Traslados/cfdi:Traslado', ns)
         for t in traslados:
-            impuesto = t.attrib.get('Impuesto')
-            importe = float(t.attrib.get('Importe', 0.0))
-            if impuesto == '002':
+            impuesto = t.attrib.get('Impuesto') or t.attrib.get('impuesto', '')
+            importe = float(t.attrib.get('Importe') or t.attrib.get('importe', 0.0))
+            
+            impuesto = impuesto.upper()
+            if impuesto in ['002', 'IVA']:
                 iva_trasladado += importe
-            elif impuesto == '003':
+            elif impuesto in ['003', 'IEPS']:
                 ieps_trasladado += importe
 
         retenciones = root.findall('./cfdi:Impuestos/cfdi:Retenciones/cfdi:Retencion', ns)
         for r in retenciones:
-            impuesto = r.attrib.get('Impuesto')
-            importe = float(r.attrib.get('Importe', 0.0))
-            if impuesto == '002':
+            impuesto = r.attrib.get('Impuesto') or r.attrib.get('impuesto', '')
+            importe = float(r.attrib.get('Importe') or r.attrib.get('importe', 0.0))
+            
+            impuesto = impuesto.upper()
+            if impuesto in ['002', 'IVA']:
                 iva_retenido += importe
-            elif impuesto == '001':
+            elif impuesto in ['001', 'ISR']:
                 isr_retenido += importe
 
         # 5. Estructurar la fila final
@@ -94,12 +107,12 @@ def procesar_factura_xml(archivo_subido):
         }
 
     except Exception as e:
-        # Si ocurre CUALQUIER error de formato, generamos una fila de alerta sin apagar la app
+        # En caso de error, mostramos en el DataFrame qué archivo falló y la razón exacta
         return {
             "Nombre emisor": "ERROR DE LECTURA",
             "Nombre receptor": "ERROR DE LECTURA",
             "Efecto del comprobante": "Desconocido",
-            "Descripción": f"El archivo '{nombre_archivo}' no es una factura válida o está dañado.",
+            "Descripción": f"El archivo '{nombre_archivo}' falló al leerse: {str(e)}",
             "Subtotal": 0.0,
             "Descuento": 0.0,
             "Subtotal Neto": 0.0,
