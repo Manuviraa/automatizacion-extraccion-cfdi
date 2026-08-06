@@ -126,6 +126,62 @@ def procesar_factura_xml(archivo_subido):
             "Fecha de Emisión": "ERROR"
         }
 
+def generar_nombre_archivo(archivos_ingresos, archivos_egresos):
+    # Valores por defecto en caso de que algo falle
+    rfc_cliente = "RFC_DESCONOCIDO"
+    mes_str = "MES"
+    anio_str = "AÑO"
+    
+    mapa_meses = {
+        '01': 'ENERO', '02': 'FEBRERO', '03': 'MARZO', '04': 'ABRIL',
+        '05': 'MAYO', '06': 'JUNIO', '07': 'JULIO', '08': 'AGOSTO',
+        '09': 'SEPTIEMBRE', '10': 'OCTUBRE', '11': 'NOVIEMBRE', '12': 'DICIEMBRE'
+    }
+    
+    # Tomamos el primer archivo disponible (prioridad ingresos)
+    archivo_muestra = None
+    es_ingreso = True
+    
+    if archivos_ingresos:
+        archivo_muestra = archivos_ingresos[0]
+    elif archivos_egresos:
+        archivo_muestra = archivos_egresos[0]
+        es_ingreso = False
+        
+    if archivo_muestra:
+        try:
+            # Usamos getvalue() que es seguro y no afecta la lectura posterior
+            contenido_texto = archivo_muestra.getvalue().decode('utf-8', errors='ignore')
+            root = ET.fromstring(contenido_texto)
+            
+            # Determinar versión para usar el namespace correcto
+            version = root.attrib.get('Version') or root.attrib.get('version', '4.0')
+            ns_cfdi = 'http://www.sat.gob.mx/cfd/3' if version in ['3.2', '3.3'] else 'http://www.sat.gob.mx/cfd/4'
+            ns = {'cfdi': ns_cfdi}
+            
+            # 1. Extraer RFC
+            if es_ingreso:
+                nodo_emisor = root.find('.//cfdi:Emisor', ns)
+                if nodo_emisor is not None:
+                    rfc_cliente = nodo_emisor.attrib.get('Rfc') or nodo_emisor.attrib.get('rfc', rfc_cliente)
+            else:
+                # Si solo subieron egresos, la empresa es el receptor
+                nodo_receptor = root.find('.//cfdi:Receptor', ns)
+                if nodo_receptor is not None:
+                    rfc_cliente = nodo_receptor.attrib.get('Rfc') or nodo_receptor.attrib.get('rfc', rfc_cliente)
+            
+            # 2. Extraer y formatear Fecha (Formato esperado: YYYY-MM-DD...)
+            fecha = root.attrib.get('Fecha') or root.attrib.get('fecha')
+            if fecha and len(fecha) >= 10:
+                anio_str = fecha[0:4]
+                mes_num = fecha[5:7]
+                mes_str = mapa_meses.get(mes_num, "MES")
+                
+        except Exception:
+            pass # Si este archivo está corrupto, usará los valores por defecto
+            
+    return f"{rfc_cliente} - {mes_str} {anio_str}.xlsx"
+
 # ==========================================
 # INTERFAZ GRÁFICA DE STREAMLIT
 # ==========================================
@@ -169,12 +225,15 @@ if st.button("Procesar Facturas y Generar Excel", type="primary"):
         # Obtenemos el archivo creado en la memoria
         archivo_excel_final = buffer_memoria.getvalue()
         
+        # GENERAMOS EL NOMBRE DINÁMICO AQUÍ:
+        nombre_dinamico = generar_nombre_archivo(archivos_ingresos, archivos_egresos)
+        
         st.success("✅ ¡Análisis completado exitosamente! El archivo está listo.")
         
         # Botón para descargar el Excel resultante
         st.download_button(
             label="📥 Descargar Reporte en Excel",
             data=archivo_excel_final,
-            file_name="Reporte_Mensual_Facturas.xlsx",
+            file_name=nombre_dinamico, # APLICAMOS EL NOMBRE DINÁMICO
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
